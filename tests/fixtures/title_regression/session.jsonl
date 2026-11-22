@@ -1,0 +1,3 @@
+{"type":"session_meta","payload":{"id":"fixture-named","cwd":"/tmp"}}
+{"type":"response_item","payload":{"id":"msg_fixture-user","type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/tmp</cwd>\n  <shell>bash</shell>\n  <current_date>2026-01-21</current_date>\n</environment_context>"}]}}
+{"type":"response_item","payload":{"id":"msg_fixture-task","type":"message","role":"user","content":[{"type":"input_text","text":"真实任务 fixture"}],"tool_call_id":"call_fixture-tool"}}

@@ -1,0 +1,19 @@
+/target/
+
+# Editor settings
+.idea/
+.vscode/
+
+# Python test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local temporary files and environment data
+*.log
+*.tmp
+.env
+.env.*
+/.codex/
+/.agents/
+/.aws/
