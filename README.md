@@ -2,14 +2,44 @@
 
 `czi` is a Linux terminal picker for local Codex sessions. It scans Codex history read-only, lists recent sessions across projects, and runs native `codex resume <SESSION_ID>` in the recorded working directory.
 
-## Build and install
+## Installation and quick start
+
+CZI supports x86-64 Linux and WSL2, with Bash or Fish. Install and configure the Codex CLI first; browsing and resuming require discoverable local Codex sessions. CZI currently supports Codex only.
+
+### Option A: download a release
+
+Once the beta is published, download the archive and checksum from [GitHub Releases](https://github.com/boxijiekexun/czi/releases). The x86-64 GNU build requires glibc 2.35 or newer. For v0.3.4:
 
 ```bash
-cargo build --release
-install -Dm755 target/release/czi ~/.local/bin/czi
+curl -fLO https://github.com/boxijiekexun/czi/releases/download/v0.3.4/czi-v0.3.4-x86_64-unknown-linux-gnu.tar.gz
+curl -fLO https://github.com/boxijiekexun/czi/releases/download/v0.3.4/SHA256SUMS
+sha256sum -c SHA256SUMS
+tar -xzf czi-v0.3.4-x86_64-unknown-linux-gnu.tar.gz
+install -Dm755 czi/czi "$HOME/.local/bin/czi"
 ```
 
-Ensure `~/.local/bin` is in `PATH`. The binary works directly from Bash and Fish; no shell function is required.
+Ensure `~/.local/bin` is on `PATH`, then run `czi doctor`. No Rust installation or sudo is required for the binary.
+
+### Option B: build from source
+
+With Rust and Cargo installed:
+
+```bash
+cargo install --git https://github.com/boxijiekexun/czi.git --locked
+```
+
+Or clone and build:
+
+```bash
+git clone https://github.com/boxijiekexun/czi.git
+cd czi
+cargo build --release --locked
+install -Dm755 target/release/czi "$HOME/.local/bin/czi"
+```
+
+### Enable shell integration
+
+For Bash, run `eval "$(czi init bash)"`; for Fish, run `czi init fish | source`. Add the appropriate command to your shell configuration if you want it loaded in new shells. Then run `czi` to browse sessions. The integration lets CZI change the parent shell's directory before resuming Codex, so the shell stays in the project directory after Codex exits. The standalone binary cannot change its parent shell's directory.
 
 ## Commands
 

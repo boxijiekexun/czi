@@ -124,10 +124,14 @@ def invalid_id(binary, root):
 def signal_after_launch(binary, root):
     setup(binary, root)
     ready = root / "codex-ready"
-    received = root / "codex-term"
+    acknowledgement = root / "codex-term.fifo"
+    os.mkfifo(acknowledgement, 0o600)
+    ack_fd = os.open(acknowledgement, os.O_RDWR | os.O_NONBLOCK)
     codex = root / "bin" / "codex"
     fake = root / "fake_codex_term.py"
-    fake.write_text(f'import signal\nfrom pathlib import Path\ndef stop(sig, frame):\n Path({str(received)!r}).write_text(str(sig))\n raise SystemExit(143)\nsignal.signal(signal.SIGTERM, stop)\np=Path({str(ready)!r})\nt=p.with_suffix(".new")\nt.write_text("ready")\nt.replace(p)\nwhile True: signal.pause()\n')
+    # The session leader may exit first, causing a PTY SIGHUP; keep that
+    # separate from the SIGTERM delivery this test is intended to verify.
+    fake.write_text(f'import os, signal\nfrom pathlib import Path\ndef stop(sig, frame):\n fd=os.open({str(acknowledgement)!r}, os.O_WRONLY | os.O_NONBLOCK)\n os.write(fd, bytes([sig]))\n os.close(fd)\n raise SystemExit(143)\nsignal.signal(signal.SIGHUP, signal.SIG_IGN)\nsignal.signal(signal.SIGTERM, stop)\np=Path({str(ready)!r})\nt=p.with_suffix(".new")\nt.write_text("ready")\nt.replace(p)\nwhile True: signal.pause()\n')
     codex.write_text(f'#!/bin/sh\nif [ "$1" = --version ]; then exit 0; fi\nexec python3 {shlex.quote(str(fake))}\n')
     picker = Picker(binary, root, args=[])
     done = False
@@ -142,6 +146,9 @@ def signal_after_launch(binary, root):
         flags = termios.tcgetattr(picker.master)[3]
         assert flags & termios.ECHO and flags & termios.ICANON, "TUI did not restore terminal before launch"
         os.killpg(picker.pid, signal.SIGTERM)
+        readable, _, _ = select.select([ack_fd], [], [], 5)
+        assert readable and os.read(ack_fd, 1) == bytes([signal.SIGTERM]), "Codex did not receive SIGTERM"
+        deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             pid, status = os.waitpid(picker.pid, os.WNOHANG)
             if pid:
@@ -149,14 +156,13 @@ def signal_after_launch(binary, root):
                 break
             time.sleep(0.01)
         assert done and os.waitstatus_to_exitcode(status) == -signal.SIGTERM, "CZI swallowed SIGTERM after launching Codex"
-        while not received.exists() and time.monotonic() < deadline: time.sleep(0.01)
-        assert received.exists(), "Codex did not receive SIGTERM"
     finally:
         if not done:
             try: os.killpg(picker.pid, signal.SIGKILL)
             except ProcessLookupError: pass
             os.waitpid(picker.pid, 0)
         os.close(picker.master)
+        os.close(ack_fd)
 
 
 def main():
