@@ -76,6 +76,59 @@ fn last_invokes_fake_codex_with_session_id_and_recorded_cwd() {
 }
 
 #[test]
+fn indexed_session_resumes_with_full_native_id_after_empty_rename() {
+    let root = tempdir().unwrap();
+    let project = root.path().join("项目 with spaces");
+    let codex_home = root.path().join("codex");
+    let sessions = codex_home.join("sessions");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let id = "11111111-2222-3333-4444-555555555555";
+    fs::write(
+        sessions.join("session.jsonl"),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":{id:?},\"cwd\":{}}}}}\n",
+            serde_json::to_string(&project).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(codex_home.join("session_index.jsonl"), format!("{{\"id\":{id:?},\"thread_name\":\"中文名称\",\"updated_at\":\"2026-01-01T00:00:00Z\"}}\n{{\"id\":{id:?},\"thread_name\":\"\",\"updated_at\":\"2026-01-02T00:00:00Z\"}}\n")).unwrap();
+    let log = root.path().join("codex.log");
+    let codex = bin.join("codex");
+    fs::write(
+        &codex,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$PWD\" \"$1\" \"$2\" > {}\n",
+            shell_quote(&log)
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var_os("PATH")
+            .unwrap_or_default()
+            .to_string_lossy()
+    );
+    let status = Command::new(env!("CARGO_BIN_EXE_czi"))
+        .args(["--shell-resume", id])
+        .current_dir(&project)
+        .env("CODEX_HOME", &codex_home)
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .env("PATH", path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(
+        fs::read_to_string(log).unwrap(),
+        format!("{}\nresume\n{id}\n", project.display())
+    );
+}
+
+#[test]
 fn bash_and_fish_shell_integrations_cd_before_real_shell_resume() {
     let root = tempdir().unwrap();
     let cwd_a = root.path().join("project A");

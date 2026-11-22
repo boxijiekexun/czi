@@ -1,0 +1,2 @@
+{"timestamp":"2026-11-20T09:00:00Z","type":"session_meta","payload":{"id":"fixture-B-00000000-1111-2222-333333333333","cwd":"/tmp/czi-fixture/B","timestamp":"2026-11-20T09:00:00Z"}}
+{"timestamp":"2026-11-20T10:00:00Z","type":"event_msg","payload":{"type":"task_started"}}

@@ -95,8 +95,9 @@ struct LastState {
 #[derive(Clone, Debug, Default)]
 struct IndexRecord {
     title: Option<String>,
+    title_updated_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
-    order: usize,
+    title_order: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,17 +238,20 @@ fn parse_session(
 ) -> Option<SessionEntry> {
     let file = File::open(path).ok()?;
     let mut reader = BufReader::new(file);
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut id = None;
     let mut cwd = None;
+    let mut created = None;
     let mut activity = None;
     let mut first_task = None;
-    for _ in 0..64 {
+    let mut line_number = 0usize;
+    loop {
         line.clear();
-        if reader.read_line(&mut line).ok()? == 0 {
+        if reader.read_until(b'\n', &mut line).ok()? == 0 {
             break;
         }
-        let value: Value = match serde_json::from_str(&line) {
+        line_number += 1;
+        let value: Value = match serde_json::from_slice(&line) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -256,21 +260,30 @@ fn parse_session(
         if kind == "session_meta" {
             id = find_string(payload, &["id", "session_id"]).or(id);
             cwd = find_string(payload, &["cwd", "working_directory"]).or(cwd);
-            activity = parse_time(
-                payload
-                    .get("updated_at")
-                    .or_else(|| payload.get("timestamp")),
+            created = created.max(
+                parse_time(payload.get("timestamp")).or_else(|| parse_time(value.get("timestamp"))),
+            );
+            activity = activity.max(parse_time(payload.get("updated_at")));
+        }
+        // In observed Codex 0.171 rollouts these events mark a turn or an
+        // item being completed. Ignore bookkeeping and metadata timestamps.
+        if kind == "event_msg"
+            && matches!(
+                payload.get("type").and_then(Value::as_str),
+                Some(
+                    "task_started"
+                        | "task_complete"
+                        | "turn_aborted"
+                        | "user_message"
+                        | "agent_message"
+                        | "item_completed"
+                )
             )
-            .or(activity);
+        {
+            activity = activity.max(parse_time(value.get("timestamp")));
         }
-        if first_task.is_none() {
+        if first_task.is_none() && line_number <= 64 {
             first_task = user_task_from_record(&value);
-        }
-        if id.is_some() && cwd.is_some() {
-            // Continue through the bounded prefix so a first user task can provide a fallback title.
-            if first_task.is_some() {
-                break;
-            }
         }
     }
     let session_id = id?;
@@ -294,7 +307,7 @@ fn parse_session(
         cwd,
         thread_name,
         preview,
-        last_active: activity.or(index.updated_at).or(modified),
+        last_active: activity.max(index.updated_at).or(created).or(modified),
         source_file: path.to_path_buf(),
         resumable: true,
     })
@@ -306,12 +319,18 @@ fn read_titles(home: &Path) -> std::collections::HashMap<String, IndexRecord> {
     let Ok(file) = File::open(path) else {
         return out;
     };
-    for (order, line) in BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .enumerate()
-    {
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut order = 0usize;
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let current_order = order;
+        order += 1;
+        let Ok(v) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
         let Some(id) = find_string(&v, &["id", "session_id"]) else {
@@ -320,29 +339,38 @@ fn read_titles(home: &Path) -> std::collections::HashMap<String, IndexRecord> {
         let title = find_string(&v, &["thread_name"])
             .map(|title| clean_text(&title))
             .filter(|title| !title.is_empty());
-        let updated = parse_time(v.get("updated_at").or_else(|| v.get("last_active_at")));
-        let candidate = IndexRecord {
-            title,
-            updated_at: updated,
-            order,
-        };
-        let replace = out
-            .get(&id)
-            .map(|previous| newer_index_record(previous, &candidate))
-            .unwrap_or(true);
-        if replace {
-            out.insert(id, candidate);
+        let updated = parse_time(v.get("updated_at")).max(parse_time(v.get("last_active_at")));
+        let record: &mut IndexRecord = out.entry(id).or_default();
+        record.updated_at = record.updated_at.max(updated);
+        if let Some(title) = title {
+            let replace = record.title.is_none()
+                || newer_name(
+                    record.title_updated_at,
+                    record.title_order,
+                    updated,
+                    current_order,
+                );
+            if replace {
+                record.title = Some(title);
+                record.title_updated_at = updated;
+                record.title_order = current_order;
+            }
         }
     }
     out
 }
 
-fn newer_index_record(previous: &IndexRecord, candidate: &IndexRecord) -> bool {
-    match (previous.updated_at, candidate.updated_at) {
+fn newer_name(
+    previous: Option<DateTime<Utc>>,
+    previous_order: usize,
+    candidate: Option<DateTime<Utc>>,
+    candidate_order: usize,
+) -> bool {
+    match (previous, candidate) {
         (Some(previous), Some(candidate)) if previous != candidate => candidate > previous,
         (None, Some(_)) => true,
         (Some(_), None) => false,
-        _ => candidate.order >= previous.order,
+        _ => candidate_order >= previous_order,
     }
 }
 
@@ -1805,6 +1833,166 @@ mod tests {
             discover(dir.path())[0].preview.as_deref(),
             Some("Fallback task with line break")
         );
+        assert_eq!(
+            discover(dir.path())[0].thread_name.as_deref(),
+            Some("New Name")
+        );
+    }
+
+    #[test]
+    fn name_and_activity_are_aggregated_independently() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("session_index.jsonl"), concat!(
+            "{\"id\":\"a\",\"thread_name\":\"较新🙂\",\"updated_at\":\"2026-11-21T10:00:00Z\"}\n",
+            "{\"id\":\"a\",\"thread_name\":\"较旧\",\"updated_at\":\"2026-11-20T10:00:00Z\"}\n",
+            "{\"id\":\"a\",\"thread_name\":\"同一时刻\",\"updated_at\":\"2026-11-21T18:00:00+08:00\"}\n",
+            "{\"id\":\"a\",\"thread_name\":\"无效时间\",\"updated_at\":\"invalid\"}\n",
+            "{\"id\":\"a\",\"thread_name\":null,\"updated_at\":\"2026-11-22T10:00:00Z\"}\n",
+            "{\"id\":\"a\",\"thread_name\":\"  \",\"updated_at\":\"2026-11-23T10:00:00Z\"}\n",
+            "{\"id\":\"a\",\"updated_at\":\"2026-11-24T10:00:00Z\"}\n",
+            "{\"id\":\"b\",\"thread_name\":\"无时间一\"}\n",
+            "{\"id\":\"b\",\"thread_name\":\"无时间二\",\"updated_at\":\"bad\"}\n",
+            "{\"id\":\"c\",\"thread_name\":\"single\"}\n",
+            "{bad json\n",
+        )).unwrap();
+        let index = read_titles(dir.path());
+        assert_eq!(index["a"].title.as_deref(), Some("同一时刻"));
+        assert_eq!(
+            index["a"].updated_at,
+            parse_time(Some(&Value::String("2026-11-24T10:00:00Z".into())))
+        );
+        assert_eq!(index["b"].title.as_deref(), Some("无时间二"));
+        assert_eq!(index["c"].title.as_deref(), Some("single"));
+    }
+
+    #[test]
+    fn invalid_utf8_jsonl_line_does_not_hide_later_records() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(dir.path().join("session_index.jsonl"), b"\xff\n{\"id\":\"fixture\",\"thread_name\":\"valid\",\"updated_at\":\"2026-01-02T00:00:00Z\"}\n").unwrap();
+        fs::write(sessions.join("session.jsonl"), b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"fixture\",\"cwd\":\"/tmp\"}}\n\xff\n{\"type\":\"event_msg\",\"timestamp\":\"2026-01-03T00:00:00Z\",\"payload\":{\"type\":\"task_complete\"}}\n").unwrap();
+        let found = discover(dir.path());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].thread_name.as_deref(), Some("valid"));
+        assert_eq!(
+            found[0].last_active,
+            parse_time(Some(&Value::String("2026-01-03T00:00:00Z".into())))
+        );
+    }
+
+    #[test]
+    fn scan_orders_activity_and_keeps_native_names_and_ids() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::copy(
+            "tests/fixtures/activity_order/session_index.jsonl",
+            dir.path().join("session_index.jsonl"),
+        )
+        .unwrap();
+        for name in ["session-a.jsonl", "session-b.jsonl", "session-c.jsonl"] {
+            fs::copy(
+                Path::new("tests/fixtures/activity_order").join(name),
+                sessions.join(name),
+            )
+            .unwrap();
+        }
+        // An event after the old 64-line scan and a freshly modified file must
+        // not mask the later index activity of another session.
+        let mut b = OpenOptions::new()
+            .append(true)
+            .open(sessions.join("session-b.jsonl"))
+            .unwrap();
+        for _ in 0..65 {
+            writeln!(b, "{{\"type\":\"unrelated\"}}").unwrap();
+        }
+        writeln!(b, "{{\"type\":\"event_msg\",\"timestamp\":\"2026-11-21T11:00:00Z\",\"payload\":{{\"type\":\"task_complete\"}}}}").unwrap();
+        b.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(4_102_444_800)),
+        )
+        .unwrap();
+        let found = discover(dir.path());
+        assert_eq!(found.len(), 3);
+        assert_eq!(
+            found
+                .iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "fixture-A-00000000-1111-2222-333333333333",
+                "fixture-C-00000000-1111-2222-333333333333",
+                "fixture-B-00000000-1111-2222-333333333333"
+            ]
+        );
+        assert_eq!(found[0].thread_name.as_deref(), Some("最新名称🙂"));
+        assert_eq!(found[1].thread_name.as_deref(), Some("数据库优化"));
+        assert_eq!(
+            found[1].last_active,
+            parse_time(Some(&Value::String("2026-11-22T13:00:00Z".into())))
+        );
+        assert_eq!(
+            found[2].last_active,
+            parse_time(Some(&Value::String("2026-11-21T11:00:00Z".into())))
+        );
+        assert!(matches(
+            &found[0],
+            "fixture-A-00000000-1111-2222-333333333333"
+        ));
+        assert!(matches(&found[1], "数据库"));
+        let mut terminal = Terminal::new(TestBackend::new(120, 19)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_ui(
+                    frame,
+                    UiRender {
+                        sessions: &found,
+                        filtered: &found,
+                        query: "",
+                        mode: UiMode::Browsing,
+                        project_view: false,
+                        selected: 0,
+                        scroll_offset: 0,
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let first_row: String = (0..120).map(|x| buffer[(x, 6)].symbol()).collect();
+        assert!(first_row.contains(&display_time(found[0].last_active)));
+    }
+
+    #[test]
+    fn missing_activity_uses_creation_then_modification_and_ties_are_stable() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        for id in ["tie-b", "tie-a"] {
+            fs::write(sessions.join(format!("{id}.jsonl")), format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"/tmp\",\"timestamp\":\"2026-01-01T00:00:00Z\"}}}}\n")).unwrap();
+        }
+        fs::write(sessions.join("mtime.jsonl"), "{\"type\":\"session_meta\",\"payload\":{\"id\":\"mtime\",\"cwd\":\"/tmp\",\"timestamp\":\"invalid\"}}\n").unwrap();
+        let found = discover(dir.path());
+        let tied: Vec<_> = found
+            .iter()
+            .filter(|s| s.session_id.starts_with("tie-"))
+            .collect();
+        assert_eq!(
+            tied.iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tie-a", "tie-b"]
+        );
+        assert_eq!(
+            tied[0].last_active,
+            parse_time(Some(&Value::String("2026-01-01T00:00:00Z".into())))
+        );
+        assert!(found
+            .iter()
+            .find(|s| s.session_id == "mtime")
+            .unwrap()
+            .last_active
+            .is_some());
     }
 
     #[test]
@@ -2033,6 +2221,176 @@ mod tests {
             sessions.len(),
             named
         );
+    }
+
+    #[test]
+    fn real_data_activity_audit_when_enabled() {
+        if env::var_os("CZI_ACTIVITY_AUDIT").is_none() {
+            return;
+        }
+        use std::collections::{HashMap, HashSet};
+        let home = codex_home();
+        let mut paths = Vec::new();
+        fn collect(dir: &Path, depth: usize, paths: &mut Vec<PathBuf>) {
+            if depth > 8 {
+                return;
+            }
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        collect(&path, depth + 1, paths);
+                    } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+        collect(&home.join("sessions"), 0, &mut paths);
+        let mut old_index: HashMap<String, (Option<DateTime<Utc>>, usize)> = HashMap::new();
+        let mut ids = HashSet::new();
+        let (mut duplicate, mut empty, mut invalid, mut missing, mut malformed) = (0, 0, 0, 0, 0);
+        if let Ok(file) = File::open(home.join("session_index.jsonl")) {
+            for (order, line) in BufReader::new(file)
+                .lines()
+                .map_while(Result::ok)
+                .enumerate()
+            {
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    malformed += 1;
+                    continue;
+                };
+                let Some(id) = find_string(&value, &["id", "session_id"]) else {
+                    continue;
+                };
+                if !ids.insert(id.clone()) {
+                    duplicate += 1;
+                }
+                if find_string(&value, &["thread_name"])
+                    .map(|s| clean_text(&s))
+                    .is_none_or(|s| s.is_empty())
+                {
+                    empty += 1;
+                }
+                let raw = value
+                    .get("updated_at")
+                    .or_else(|| value.get("last_active_at"));
+                let updated = parse_time(raw);
+                if raw.is_none() {
+                    missing += 1;
+                }
+                for key in ["updated_at", "last_active_at"] {
+                    if value
+                        .get(key)
+                        .is_some_and(|raw| parse_time(Some(raw)).is_none())
+                    {
+                        invalid += 1;
+                    }
+                }
+                let replace = old_index
+                    .get(&id)
+                    .is_none_or(|(time, old_order)| newer_name(*time, *old_order, updated, order));
+                if replace {
+                    old_index.insert(id, (updated, order));
+                }
+            }
+        }
+        let sessions = discover(&home);
+        let new_index = read_titles(&home);
+        let mut old = Vec::new();
+        let mut changed = 0usize;
+        let mut event_newer = 0usize;
+        let mut index_newer = 0usize;
+        for session in &sessions {
+            let mut old_meta = None;
+            let mut got_id = false;
+            let mut got_cwd = false;
+            let mut task = false;
+            let mut legacy_done = false;
+            if let Ok(file) = File::open(&session.source_file) {
+                for (line_no, line) in BufReader::new(file)
+                    .lines()
+                    .map_while(Result::ok)
+                    .enumerate()
+                {
+                    let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                        malformed += 1;
+                        continue;
+                    };
+                    let payload = value.get("payload").unwrap_or(&value);
+                    if line_no < 64
+                        && !legacy_done
+                        && value.get("type").and_then(Value::as_str) == Some("session_meta")
+                    {
+                        got_id |= find_string(payload, &["id", "session_id"]).is_some();
+                        got_cwd |= find_string(payload, &["cwd", "working_directory"]).is_some();
+                        old_meta = parse_time(
+                            payload
+                                .get("updated_at")
+                                .or_else(|| payload.get("timestamp")),
+                        )
+                        .or(old_meta);
+                    }
+                    if line_no < 64 && !legacy_done && !task {
+                        task = user_task_from_record(&value).is_some();
+                    }
+                    if let Some(raw) = value.get("timestamp") {
+                        if parse_time(Some(raw)).is_none() {
+                            invalid += 1;
+                        }
+                    }
+                    if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+                        for key in ["timestamp", "updated_at"] {
+                            if payload
+                                .get(key)
+                                .is_some_and(|raw| parse_time(Some(raw)).is_none())
+                            {
+                                invalid += 1;
+                            }
+                        }
+                    }
+                    // Continue for statistics but stop applying old parser state at its original break.
+                    if got_id && got_cwd && task {
+                        legacy_done = true;
+                    }
+                }
+            }
+            let modified = fs::metadata(&session.source_file)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .and_then(|d| {
+                    DateTime::<Utc>::from_timestamp(d.as_secs() as i64, d.subsec_nanos())
+                });
+            let old_time = old_meta
+                .or(old_index
+                    .get(&session.session_id)
+                    .and_then(|(time, _)| *time))
+                .or(modified);
+            if old_time != session.last_active {
+                changed += 1;
+                let index_time = new_index
+                    .get(&session.session_id)
+                    .and_then(|r| r.updated_at);
+                if index_time.is_some_and(|t| Some(t) == session.last_active) {
+                    index_newer += 1;
+                } else {
+                    event_newer += 1;
+                }
+            }
+            old.push((session.session_id.clone(), old_time));
+        }
+        old.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let old_positions: HashMap<_, _> =
+            old.iter().enumerate().map(|(i, (id, _))| (id, i)).collect();
+        let moved = sessions
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| old_positions.get(&s.session_id) != Some(i))
+            .count();
+        let named = sessions.iter().filter(|s| s.thread_name.is_some()).count();
+        eprintln!("activity audit: scanned={} parsed={} named={} unnamed={} duplicate_index={} empty_names={} invalid_times={} missing_index_times={} malformed_lines={} changed_times={} moved_positions={} index_latest={} other_latest={}",
+            paths.len(), sessions.len(), named, sessions.len() - named, duplicate, empty, invalid, missing, malformed, changed, moved, index_newer, event_newer);
     }
 
     #[test]
