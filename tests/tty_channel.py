@@ -41,7 +41,7 @@ def setup(binary, root):
     return project, bin_dir
 
 
-def exercise(binary, root, *, shell=None, key=b"\x1b[B\r", exit_code=0, mode="", count=1, redirect_input=False, timeout_query=False):
+def exercise(binary, root, *, shell=None, key=b"\x1b[B\r", exit_code=0, mode="", count=1, redirect_input=False, timeout_query=False, terminate_picker=False):
     project, bin_dir = setup(binary, root)
     (root / "tmp").mkdir(exist_ok=True)
     log, baseline = (root / name for name in ("codex.log", "termios.json"))
@@ -138,7 +138,13 @@ def exercise(binary, root, *, shell=None, key=b"\x1b[B\r", exit_code=0, mode="",
                         samples.append((fds, rss, selector_seen))
                     except (FileNotFoundError, PermissionError, StopIteration, ProcessLookupError):
                         pass
-                    os.write(master, key)
+                    if terminate_picker:
+                        children = (Path(f"/proc/{pid}/task/{pid}/children").read_text().split() if shell else [str(pid)])
+                        targets = [int(child) for child in children if Path(f"/proc/{child}/comm").read_text().strip() == "czi"]
+                        assert len(targets) == 1, f"cannot identify picker: {targets}"
+                        os.kill(targets[0], signal.SIGTERM)
+                    else:
+                        os.write(master, key)
                     sent += 1
                     view = b""
             if exit_code == "waitsig" and not sent_signal and signal_pid.exists():
@@ -173,7 +179,7 @@ def exercise(binary, root, *, shell=None, key=b"\x1b[B\r", exit_code=0, mode="",
             assert result == b"", repr(result)
         elif shell:
             expected_cwd = project if selected or mode in ("last", ".") else root
-            shell_status = (130 if exit_code in ("signal", "waitsig") else exit_code) if selected or mode == "last" else 0
+            shell_status = 143 if terminate_picker else ((130 if exit_code in ("signal", "waitsig") else exit_code) if selected or mode == "last" else 0)
             if count > 1:
                 fields = result.split(b"\0")
                 assert len(fields) == 2 + count * 3, repr(result)

@@ -95,7 +95,7 @@ class Screen:
 
 
 class Picker:
-    def __init__(self, binary, root, width=120, height=40):
+    def __init__(self, binary, root, width=120, height=40, args=None):
         self.root = root
         self.output = root / "nav.out"
         self.pid, self.master = pty.fork()
@@ -107,7 +107,7 @@ class Picker:
             os.environ.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"),
                               XDG_STATE_HOME=str(root / "state"), CODEX_HOME=str(root / "codex"),
                               PATH=str(root / "bin") + ":" + os.environ["PATH"], TERM="xterm")
-            os.execv(binary, [binary, "--shell-select"])
+            os.execv(binary, [binary, *(args if args is not None else ["--shell-select"])])
         self.screen = Screen(width, height)
         self.raw = b""
         self.query_buffer = b""
@@ -117,8 +117,20 @@ class Picker:
     def resize(self, width, height):
         if getattr(self, "size_set", False) and (width, height) == (self.screen.width, self.screen.height):
             return
+        if getattr(self, "size_set", False):
+            # Finish consuming the previous frame before invalidating our
+            # simulated screen; event-driven rendering has no idle redraw.
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([self.master], [], [], 0.03)
+                if not ready:
+                    break
+                self.pump()
         self.screen.resize(width, height)
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+        if getattr(self, "size_set", False):
+            # Some PTY runners do not assign a foreground process group.
+            os.killpg(self.pid, signal.SIGWINCH)
         self.size_set = True
         self.operations.append(f"resize({width},{height})")
 

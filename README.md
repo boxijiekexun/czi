@@ -62,6 +62,8 @@ After upgrading CZI, reload the generated function in existing Shells (`eval "$(
 
 For a PTY check of terminal/output separation and the Bash/Fish integrations, run `python3 tests/tty_channel.py target/release/czi` after building. The test uses synthetic session data and a fake Codex executable; it requires Python 3 and Fish. `cargo test` runs the same check when those programs are installed, and reports a skip when either is unavailable.
 
+To run the focused search, SIGTERM and malformed-ID PTY regressions separately, use `python3 tests/stability_regressions.py target/release/czi`.
+
 The repeatable stability runner uses isolated HOME, `CODEX_HOME`, `XDG_STATE_HOME`, and temporary files. It never opens real Codex history or runs the real Codex executable. Install Bash, Fish, Python 3 and `stty`, build a release binary, then run:
 
 ```sh

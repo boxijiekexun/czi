@@ -1,9 +1,10 @@
 use std::{
     env,
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitStatus},
+    sync::atomic::{AtomicBool, Ordering},
     time::UNIX_EPOCH,
 };
 
@@ -301,6 +302,7 @@ fn parse_session(
     let preview = first_task
         .map(|text| clean_text(&text))
         .filter(|text| !text.is_empty());
+    let resumable = valid_session_id(&session_id);
     Some(SessionEntry {
         provider: "codex".into(),
         session_id,
@@ -309,7 +311,7 @@ fn parse_session(
         preview,
         last_active: activity.max(index.updated_at).or(created).or(modified),
         source_file: path.to_path_buf(),
-        resumable: true,
+        resumable,
     })
 }
 
@@ -395,18 +397,65 @@ fn discover(home: &Path) -> Vec<SessionEntry> {
         }
     }
     walk(&root, &mut files, 0);
-    let mut seen = std::collections::HashSet::new();
-    let mut result: Vec<_> = files
+    let mut entries: Vec<_> = files
         .into_iter()
         .filter_map(|p| parse_session(&p, &titles))
-        .filter(|s| seen.insert(s.session_id.clone()))
         .collect();
+    // Identical ID and canonical cwd represent one candidate. Prefer its
+    // latest activity and use the path as a deterministic tie-breaker.
+    entries.sort_by(|a, b| {
+        a.session_id
+            .cmp(&b.session_id)
+            .then_with(|| normalize(&a.cwd).cmp(&normalize(&b.cwd)))
+            .then_with(|| b.last_active.cmp(&a.last_active))
+            .then_with(|| a.source_file.cmp(&b.source_file))
+    });
+    let mut result: Vec<SessionEntry> = Vec::new();
+    for entry in entries {
+        if let Some(previous) = result.last_mut() {
+            if previous.session_id == entry.session_id
+                && normalize(&previous.cwd) == normalize(&entry.cwd)
+            {
+                // Equal-time records with different contents cannot be
+                // distinguished safely using the native ID and cwd.
+                if previous.last_active == entry.last_active
+                    && !same_history(&previous.source_file, &entry.source_file).unwrap_or(false)
+                {
+                    previous.resumable = false;
+                }
+                continue;
+            }
+        }
+        result.push(entry);
+    }
     result.sort_by(|a, b| {
         b.last_active
             .cmp(&a.last_active)
             .then_with(|| a.session_id.cmp(&b.session_id))
     });
     result
+}
+
+fn same_history(a: &Path, b: &Path) -> io::Result<bool> {
+    let mut left = File::open(a)?;
+    let mut right = File::open(b)?;
+    let length = left.metadata()?.len();
+    let mut remaining = length;
+    if length != right.metadata()?.len() {
+        return Ok(false);
+    }
+    let mut left_buf = [0u8; 8192];
+    let mut right_buf = [0u8; 8192];
+    while remaining > 0 {
+        let count = remaining.min(left_buf.len() as u64) as usize;
+        left.read_exact(&mut left_buf[..count])?;
+        right.read_exact(&mut right_buf[..count])?;
+        if left_buf[..count] != right_buf[..count] {
+            return Ok(false);
+        }
+        remaining -= count as u64;
+    }
+    Ok(left.metadata()?.len() == length && right.metadata()?.len() == length)
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -433,21 +482,49 @@ fn save_last(session: &SessionEntry) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
     let state = LastState {
         provider: session.provider.clone(),
         session_id: session.session_id.clone(),
         cwd: session.cwd.clone(),
         started_at: Utc::now(),
     };
-    let mut file = File::create(&tmp)?;
+    let mut file =
+        tempfile::NamedTempFile::new_in(path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "state path has no parent")
+        })?)?;
     serde_json::to_writer_pretty(&mut file, &state)?;
     file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(tmp, path)
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+fn valid_session_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                *b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn ensure_resumable(session: &SessionEntry) -> Result<(), String> {
+    if !valid_session_id(&session.session_id) {
+        return Err("session ID is not a valid native UUID".into());
+    }
+    if !session.resumable {
+        return Err(
+            "conflicting session history records are ambiguous for this ID and directory".into(),
+        );
+    }
+    Ok(())
 }
 
 fn launch(session: &SessionEntry) -> Result<ExitStatus, String> {
+    ensure_resumable(session)?;
     if !session.cwd.is_dir() {
         return Err(format!(
             "session working directory does not exist: {}",
@@ -462,11 +539,12 @@ fn launch(session: &SessionEntry) -> Result<ExitStatus, String> {
     let mut child = command
         .spawn()
         .map_err(|e| format!("failed to start codex: {e}"))?;
-    let state_result = save_last(session);
+    if let Err(error) = save_last(session) {
+        eprintln!("czi: codex started, but could not save czi last state: {error}");
+    }
     let status = child
         .wait()
         .map_err(|e| format!("failed while waiting for codex: {e}"))?;
-    state_result.map_err(|e| format!("codex started, but could not save czi last state: {e}"))?;
     Ok(status)
 }
 
@@ -549,16 +627,18 @@ fn shorten_path(path: &Path, max_width: usize) -> String {
 
 fn short_id(sessions: &[SessionEntry], index: usize) -> String {
     let id = &sessions[index].session_id;
-    let mut length = 8.min(id.len());
-    while length < id.len()
-        && sessions
-            .iter()
-            .enumerate()
-            .any(|(other, session)| other != index && session.session_id.starts_with(&id[..length]))
+    let mut length = 8.min(id.chars().count());
+    while length < id.chars().count()
+        && sessions.iter().enumerate().any(|(other, session)| {
+            other != index
+                && session
+                    .session_id
+                    .starts_with(&id.chars().take(length).collect::<String>())
+        })
     {
         length += 1;
     }
-    id[..length].to_string()
+    clean_text(&id.chars().take(length).collect::<String>())
 }
 
 fn session_label(sessions: &[SessionEntry], index: usize) -> String {
@@ -626,8 +706,15 @@ fn move_selection(
     (next, keep_visible(next, scroll_offset, capacity, total))
 }
 
-fn selected_index_by_id(sessions: &[SessionEntry], id: Option<&str>) -> Option<usize> {
-    id.and_then(|id| sessions.iter().position(|session| session.session_id == id))
+fn selected_index_by_id(
+    sessions: &[SessionEntry],
+    selection: Option<&(String, PathBuf)>,
+) -> Option<usize> {
+    selection.and_then(|(id, path)| {
+        sessions
+            .iter()
+            .position(|session| &session.session_id == id && &session.source_file == path)
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -781,7 +868,10 @@ fn draw_ui(frame: &mut Frame<'_>, state: UiRender<'_>) -> (usize, usize) {
         .map(|(offset, session)| {
             let original = sessions
                 .iter()
-                .position(|candidate| candidate.session_id == session.session_id)
+                .position(|candidate| {
+                    candidate.source_file == session.source_file
+                        && candidate.session_id == session.session_id
+                })
                 .unwrap_or(0);
             let label = session_label(sessions, original);
             let selected_style = if start + offset == selected {
@@ -984,6 +1074,8 @@ fn run_tui(
     mut sessions: Vec<SessionEntry>,
     project_view: bool,
 ) -> Result<Option<SessionEntry>, String> {
+    let _term_signal =
+        TermSignalGuard::install().map_err(|e| format!("cannot register SIGTERM handler: {e}"))?;
     if project_view {
         sessions.sort_by(|a, b| {
             a.cwd
@@ -1008,7 +1100,7 @@ fn run_tui(
     // controlling terminal even if the caller supplied a different terminal.
     let _stdin_restore = FdRestore::redirect(libc::STDIN_FILENO, tty.as_raw_fd())
         .map_err(|e| format!("cannot connect terminal input: {e}"))?;
-    run_tui_backend(
+    let result = run_tui_backend(
         TtyBackend {
             backend: CrosstermBackend::new(tty),
             query_tty,
@@ -1016,7 +1108,45 @@ fn run_tui(
         sessions,
         project_view,
         height,
-    )
+    );
+    if TERMINATED.load(Ordering::Relaxed) {
+        Err(TERM_ERROR.into())
+    } else {
+        result
+    }
+}
+
+const TERM_ERROR: &str = "terminated by SIGTERM";
+static TERMINATED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_sigterm(_: libc::c_int) {
+    TERMINATED.store(true, Ordering::Relaxed);
+}
+
+struct TermSignalGuard(libc::sigaction);
+impl TermSignalGuard {
+    fn install() -> io::Result<Self> {
+        TERMINATED.store(false, Ordering::Relaxed);
+        // Only an atomic flag is changed in the signal handler; the previous
+        // disposition is restored before a Codex child can be launched.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handle_sigterm as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(libc::SIGTERM, &action, &mut previous) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self(previous))
+        }
+    }
+}
+impl Drop for TermSignalGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::sigaction(libc::SIGTERM, &self.0, std::ptr::null_mut());
+        }
+    }
 }
 
 // Crossterm's cursor position query writes to process stdout, regardless of the
@@ -1149,34 +1279,50 @@ fn tui_loop<B: Backend>(
     let mut selected = 0usize;
     let mut scroll_offset = 0usize;
     let mut mode = UiMode::Browsing;
-    let mut search_restore_id: Option<String> = None;
+    let mut search_restore_id: Option<(String, PathBuf)> = None;
     let mut visible_capacity = 1usize;
+    let mut filtered = Vec::new();
+    let mut dirty = true;
+    let mut last_size = terminal.size().map_err(|e| e.to_string())?;
     loop {
-        let filtered: Vec<_> = sessions
-            .iter()
-            .filter(|s| matches(s, &query))
-            .cloned()
-            .collect();
-        selected = clamp_selection(selected, filtered.len());
-        let mut rendered_view = (visible_capacity, scroll_offset);
-        terminal
-            .draw(|frame| {
-                rendered_view = draw_ui(
-                    frame,
-                    UiRender {
-                        sessions: &sessions,
-                        filtered: &filtered,
-                        query: &query,
-                        mode,
-                        project_view,
-                        selected,
-                        scroll_offset,
-                    },
-                );
-            })
-            .map_err(|e| e.to_string())?;
-        (visible_capacity, scroll_offset) = rendered_view;
+        if TERMINATED.load(Ordering::Relaxed) {
+            return Err(TERM_ERROR.into());
+        }
+        if dirty {
+            filtered = sessions
+                .iter()
+                .filter(|s| matches(s, &query))
+                .cloned()
+                .collect();
+            selected = clamp_selection(selected, filtered.len());
+            let mut rendered_view = (visible_capacity, scroll_offset);
+            terminal
+                .draw(|frame| {
+                    rendered_view = draw_ui(
+                        frame,
+                        UiRender {
+                            sessions: &sessions,
+                            filtered: &filtered,
+                            query: &query,
+                            mode,
+                            project_view,
+                            selected,
+                            scroll_offset,
+                        },
+                    );
+                })
+                .map_err(|e| e.to_string())?;
+            (visible_capacity, scroll_offset) = rendered_view;
+            dirty = false;
+        }
         if !event::poll(std::time::Duration::from_millis(16)).map_err(|e| e.to_string())? {
+            // Some PTY hosts do not deliver SIGWINCH. Detect actual size
+            // changes without redrawing unchanged frames.
+            let size = terminal.size().map_err(|e| e.to_string())?;
+            if size != last_size {
+                last_size = size;
+                dirty = true;
+            }
             continue;
         }
         let input = event::read().map_err(|e| e.to_string())?;
@@ -1189,6 +1335,7 @@ fn tui_loop<B: Backend>(
         ) {
             continue;
         }
+        dirty = true;
         match input {
             Event::Key(KeyEvent {
                 code: KeyCode::Char('c'),
@@ -1202,7 +1349,7 @@ fn tui_loop<B: Backend>(
                     query.clear();
                     mode = transition_mode(mode, UiAction::CancelSearch);
                     selected =
-                        selected_index_by_id(&sessions, search_restore_id.as_deref()).unwrap_or(0);
+                        selected_index_by_id(&sessions, search_restore_id.as_ref()).unwrap_or(0);
                     scroll_offset = 0;
                     search_restore_id = None;
                 }
@@ -1217,13 +1364,11 @@ fn tui_loop<B: Backend>(
             Event::Key(KeyEvent {
                 code: KeyCode::Char('/'),
                 ..
-            }) => {
-                if mode != UiMode::Searching {
-                    search_restore_id = filtered
-                        .get(selected)
-                        .map(|session| session.session_id.clone());
-                    mode = transition_mode(mode, UiAction::BeginSearch);
-                }
+            }) if mode != UiMode::Searching => {
+                search_restore_id = filtered
+                    .get(selected)
+                    .map(|session| (session.session_id.clone(), session.source_file.clone()));
+                mode = transition_mode(mode, UiAction::BeginSearch);
             }
             Event::Key(KeyEvent {
                 code: KeyCode::Char(c),
@@ -1342,6 +1487,7 @@ fn tui_loop<B: Backend>(
             }
             Event::Resize(_, _) => {
                 terminal.autoresize().map_err(|e| e.to_string())?;
+                last_size = terminal.size().map_err(|e| e.to_string())?;
             }
             _ => {}
         }
@@ -1392,14 +1538,16 @@ fn shell_last(home: &Path) -> Result<SessionEntry, String> {
     if !codex_available() {
         return Err("codex executable was not found".to_string());
     }
-    discover(home)
+    let session = discover(home)
         .into_iter()
         .find(|session| {
             session.session_id == last.session_id
                 && normalize(&session.cwd) == normalize(&last.cwd)
                 && session.cwd.is_dir()
         })
-        .ok_or_else(|| "last session is no longer available".to_string())
+        .ok_or_else(|| "last session is no longer available".to_string())?;
+    ensure_resumable(&session)?;
+    Ok(session)
 }
 
 fn write_selection(mut output: impl Write, session: &SessionEntry) -> io::Result<()> {
@@ -1640,6 +1788,7 @@ fn main() {
                 }
                 run_tui(sessions, cli.shell_projects || cli.projects).and_then(|selection| {
                     if let Some(session) = selection {
+                        ensure_resumable(&session)?;
                         if !session.cwd.is_dir() {
                             return Err(format!(
                                 "session working directory does not exist: {}",
@@ -1664,7 +1813,7 @@ fn main() {
             Ok(false) => std::process::exit(2),
             Err(error) => {
                 eprintln!("czi: {error}");
-                std::process::exit(1);
+                std::process::exit(if error == TERM_ERROR { 143 } else { 1 });
             }
         }
         return;
@@ -1674,19 +1823,7 @@ fn main() {
             doctor(&home);
             Ok(())
         }
-        Some(CommandKind::Last) => match load_last() {
-            Some(s) => launch_checked(&SessionEntry {
-                provider: s.provider,
-                session_id: s.session_id,
-                cwd: s.cwd,
-                thread_name: None,
-                preview: None,
-                last_active: None,
-                source_file: PathBuf::new(),
-                resumable: true,
-            }),
-            None => Err("no successful CZI launch recorded".into()),
-        },
+        Some(CommandKind::Last) => shell_last(&home).and_then(|s| launch_checked(&s)),
         Some(CommandKind::Init { shell }) => {
             print_shell_init(shell);
             Ok(())
@@ -1703,7 +1840,7 @@ fn main() {
     };
     if let Err(error) = result {
         eprintln!("czi: {error}");
-        std::process::exit(1);
+        std::process::exit(if error == TERM_ERROR { 143 } else { 1 });
     }
 }
 
@@ -1780,6 +1917,105 @@ mod tests {
             .unwrap();
         }
         assert_eq!(discover(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn regression_duplicate_id_preserves_different_cwds() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        for (file, cwd) in [("first", "/tmp/a"), ("second", "/tmp/b")] {
+            fs::write(sessions.join(format!("{file}.jsonl")), format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"11111111-2222-3333-4444-555555555555\",\"cwd\":\"{cwd}\"}}}}\n")).unwrap();
+        }
+        assert_eq!(discover(dir.path()).len(), 2);
+    }
+
+    #[test]
+    fn regression_unicode_short_id_never_panics() {
+        let session = SessionEntry {
+            provider: "codex".into(),
+            session_id: "abcdef汉🙂".into(),
+            cwd: PathBuf::from("/tmp"),
+            thread_name: None,
+            preview: None,
+            last_active: None,
+            source_file: PathBuf::new(),
+            resumable: false,
+        };
+        assert!(session_label(&[session], 0).starts_with("Session · "));
+    }
+
+    #[test]
+    fn malformed_ids_are_displayable_but_cannot_resume() {
+        let good = "01234567-89ab-cdef-0123-456789abcdef";
+        assert!(valid_session_id(good));
+        for id in [
+            "",
+            "short",
+            "abcdef汉",
+            "中english",
+            "🙂🙂🙂",
+            "01234567-89ab-cdef-0123-456789abcdeg",
+        ] {
+            let session = SessionEntry {
+                provider: "codex".into(),
+                session_id: id.into(),
+                cwd: PathBuf::from("/tmp"),
+                thread_name: None,
+                preview: None,
+                last_active: None,
+                source_file: PathBuf::new(),
+                resumable: false,
+            };
+            assert!(!valid_session_id(id));
+            assert!(ensure_resumable(&session).is_err());
+            let _ = session_label(&[session], 0);
+        }
+    }
+
+    #[test]
+    fn duplicate_selection_is_deterministic_and_equal_time_conflicts_are_blocked() {
+        for reverse in [false, true] {
+            let dir = tempdir().unwrap();
+            let sessions = dir.path().join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let rows = [("z", "2026-01-01T00:00:00Z"), ("a", "2026-01-02T00:00:00Z")];
+            for (file, time) in if reverse {
+                rows.into_iter().rev().collect::<Vec<_>>()
+            } else {
+                rows.to_vec()
+            } {
+                fs::write(sessions.join(format!("{file}.jsonl")), format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"11111111-2222-3333-4444-555555555555\",\"cwd\":\"/tmp\",\"timestamp\":\"{time}\"}}}}\n")).unwrap();
+            }
+            fs::write(sessions.join("damaged.jsonl"), "not json\n").unwrap();
+            let found = discover(dir.path());
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].source_file.file_name().unwrap(), "a.jsonl");
+            assert!(found[0].resumable);
+            fs::copy(sessions.join("a.jsonl"), sessions.join("z.jsonl")).unwrap();
+            assert!(discover(dir.path())[0].resumable);
+            writeln!(
+                OpenOptions::new()
+                    .append(true)
+                    .open(sessions.join("z.jsonl"))
+                    .unwrap(),
+                "{{\"type\":\"unrelated\"}}"
+            )
+            .unwrap();
+            assert!(!discover(dir.path())[0].resumable);
+            fs::write(sessions.join("z.jsonl"), "{\"type\":\"session_meta\",\"payload\":{\"id\":\"11111111-2222-3333-4444-555555555555\",\"cwd\":\"/tmp\",\"timestamp\":\"2026-01-01T00:00:00Z\"}}\n").unwrap();
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(sessions.join("z.jsonl"))
+                .unwrap();
+            writeln!(file, "{{\"type\":\"event_msg\",\"timestamp\":\"2026-01-02T00:00:00Z\",\"payload\":{{\"type\":\"task_complete\"}}}}").unwrap();
+            writeln!(file, "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"different task\"}}]}}}}").unwrap();
+            let found = discover(dir.path());
+            assert!(!found[0].resumable);
+            assert!(ensure_resumable(&found[0])
+                .unwrap_err()
+                .contains("ambiguous"));
+        }
     }
 
     #[test]
