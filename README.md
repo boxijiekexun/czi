@@ -1,5 +1,7 @@
 # czi 0.3.4
 
+English | [简体中文](README.zh-CN.md)
+
 `czi` is a Linux terminal picker for local Codex sessions. It scans Codex history read-only, lists recent sessions across projects, and runs native `codex resume <SESSION_ID>` in the recorded working directory.
 
 ## Installation and quick start
