@@ -796,16 +796,42 @@ struct UiRender<'a> {
     scroll_offset: usize,
 }
 
+/// Catppuccin Mocha colors used by the terminal interface.
+///
+/// Keeping the palette here makes the visual hierarchy explicit and avoids
+/// scattering RGB literals through the rendering code.
+struct Theme;
+
+impl Theme {
+    const BASE: Color = Color::Rgb(30, 30, 46);
+    const MANTLE: Color = Color::Rgb(24, 24, 37);
+    const SURFACE1: Color = Color::Rgb(69, 71, 90);
+    const SURFACE2: Color = Color::Rgb(88, 91, 112);
+    const TEXT: Color = Color::Rgb(205, 214, 244);
+    const SUBTEXT0: Color = Color::Rgb(166, 173, 200);
+    const OVERLAY0: Color = Color::Rgb(108, 112, 134);
+    const BLUE: Color = Color::Rgb(137, 180, 250);
+    const PINK: Color = Color::Rgb(245, 194, 231);
+    const MAUVE: Color = Color::Rgb(203, 166, 247);
+    const TEAL: Color = Color::Rgb(148, 226, 213);
+    const LAVENDER: Color = Color::Rgb(180, 190, 254);
+    const YELLOW: Color = Color::Rgb(249, 226, 175);
+}
+
 fn session_cell(marker: &str, label: &str, width: usize, selected: bool) -> Cell<'static> {
     let marker_style = if selected {
-        Style::default().fg(Color::Red)
-    } else {
         Style::default()
+            .fg(Theme::PINK)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Theme::OVERLAY0)
     };
     let label_style = if selected {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else {
         Style::default()
+            .fg(Theme::TEXT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Theme::TEXT)
     };
     Cell::from(Line::from(vec![
         Span::styled(marker.to_string(), marker_style),
@@ -845,20 +871,57 @@ fn draw_ui(frame: &mut Frame<'_>, state: UiRender<'_>) -> (usize, usize) {
         UiMode::Searching => "Searching",
         UiMode::FilteredBrowsing => "Filtered browsing",
     };
-    let search_line = match mode {
-        UiMode::Browsing => "/ Search".to_string(),
-        UiMode::Searching => format!("Search: {query}▏  Enter confirm · Esc cancel"),
-        UiMode::FilteredBrowsing => format!("Filter: {query}  / edit · Esc clear"),
+    let mode_style = match mode {
+        UiMode::Browsing => Style::default().fg(Theme::MAUVE),
+        UiMode::Searching => Style::default().fg(Theme::YELLOW),
+        UiMode::FilteredBrowsing => Style::default().fg(Theme::PINK),
     };
+    let search_line = match mode {
+        UiMode::Browsing => Line::from(vec![
+            Span::styled("/", Style::default().fg(Theme::PINK)),
+            Span::styled(" Search", Style::default().fg(Theme::SUBTEXT0)),
+        ]),
+        UiMode::Searching => Line::from(vec![
+            Span::styled("Search: ", Style::default().fg(Theme::PINK)),
+            Span::styled(format!("{query}▏"), Style::default().fg(Theme::TEXT)),
+            Span::styled("  Enter confirm", Style::default().fg(Theme::YELLOW)),
+            Span::styled(" · ", Style::default().fg(Theme::OVERLAY0)),
+            Span::styled("Esc cancel", Style::default().fg(Theme::SUBTEXT0)),
+        ]),
+        UiMode::FilteredBrowsing => Line::from(vec![
+            Span::styled("Filter: ", Style::default().fg(Theme::PINK)),
+            Span::styled(query.to_string(), Style::default().fg(Theme::TEXT)),
+            Span::styled("  / edit", Style::default().fg(Theme::YELLOW)),
+            Span::styled(" · ", Style::default().fg(Theme::OVERLAY0)),
+            Span::styled("Esc clear", Style::default().fg(Theme::SUBTEXT0)),
+        ]),
+    };
+    let header_line = Line::from(vec![
+        Span::styled(
+            "czi",
+            Style::default()
+                .fg(Theme::BLUE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ·  ", Style::default().fg(Theme::OVERLAY0)),
+        Span::styled(view_name, Style::default().fg(Theme::TEAL)),
+        Span::styled("  ·  ", Style::default().fg(Theme::OVERLAY0)),
+        Span::styled(mode_name, mode_style),
+        Span::styled("  ·  ", Style::default().fg(Theme::OVERLAY0)),
+        Span::styled(
+            format!("{} sessions", filtered.len()),
+            Style::default().fg(Theme::SUBTEXT0),
+        ),
+    ]);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(format!(
-                "czi  ·  {view_name}  ·  {mode_name}  ·  {} sessions",
-                filtered.len()
-            )),
-            Line::from(search_line),
-        ])
-        .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(vec![header_line, search_line])
+            .style(Style::default().fg(Theme::TEXT).bg(Theme::MANTLE))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Theme::SURFACE2))
+                    .style(Style::default().bg(Theme::MANTLE)),
+            ),
         areas[0],
     );
 
@@ -875,11 +938,9 @@ fn draw_ui(frame: &mut Frame<'_>, state: UiRender<'_>) -> (usize, usize) {
                 .unwrap_or(0);
             let label = session_label(sessions, original);
             let selected_style = if start + offset == selected {
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().bg(Theme::SURFACE1)
             } else {
-                Style::default()
+                Style::default().bg(Theme::BASE)
             };
             let is_selected = start + offset == selected;
             let marker = if is_selected { "> " } else { "  " };
@@ -900,9 +961,15 @@ fn draw_ui(frame: &mut Frame<'_>, state: UiRender<'_>) -> (usize, usize) {
                     Cell::from(truncate_width(
                         session.preview.as_deref().unwrap_or("—"),
                         usize::from(pw),
-                    )),
-                    Cell::from(shorten_path(&session.cwd, usize::from(cw))),
-                    Cell::from(format!("{time:>11}")),
+                    ))
+                    .style(Style::default().fg(if is_selected {
+                        Theme::TEXT
+                    } else {
+                        Theme::SUBTEXT0
+                    })),
+                    Cell::from(shorten_path(&session.cwd, usize::from(cw)))
+                        .style(Style::default().fg(Theme::TEAL)),
+                    Cell::from(format!("{time:>11}")).style(Style::default().fg(Theme::LAVENDER)),
                 ])
                 .style(selected_style)
                 .height(1),
@@ -917,8 +984,9 @@ fn draw_ui(frame: &mut Frame<'_>, state: UiRender<'_>) -> (usize, usize) {
                         usize::from(sw.saturating_sub(2)),
                         is_selected,
                     ),
-                    Cell::from(shorten_path(&session.cwd, usize::from(cw))),
-                    Cell::from(format!("{time:>11}")),
+                    Cell::from(shorten_path(&session.cwd, usize::from(cw)))
+                        .style(Style::default().fg(Theme::TEAL)),
+                    Cell::from(format!("{time:>11}")).style(Style::default().fg(Theme::LAVENDER)),
                 ])
                 .style(selected_style)
                 .height(1),
@@ -931,23 +999,40 @@ fn draw_ui(frame: &mut Frame<'_>, state: UiRender<'_>) -> (usize, usize) {
                             Span::styled(
                                 marker.to_string(),
                                 if is_selected {
-                                    Style::default().fg(Color::Red)
-                                } else {
                                     Style::default()
+                                        .fg(Theme::PINK)
+                                        .add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(Theme::OVERLAY0)
                                 },
                             ),
                             Span::styled(
                                 truncate_width(&label, usize::from(sw.saturating_sub(2))),
                                 if is_selected {
-                                    Style::default().add_modifier(Modifier::BOLD)
-                                } else {
                                     Style::default()
+                                        .fg(Theme::TEXT)
+                                        .add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(Theme::TEXT)
                                 },
                             ),
                         ]),
-                        Line::from(compact_detail(session, usize::from(sw))),
+                        Line::from(Span::styled(
+                            compact_detail(session, usize::from(sw)),
+                            if session.preview.is_some() {
+                                Style::default().fg(Theme::SUBTEXT0)
+                            } else {
+                                Style::default().fg(Theme::TEAL)
+                            },
+                        )),
                     ]),
-                    Cell::from(vec![Line::from(format!("{time:>11}")), Line::from("")]),
+                    Cell::from(vec![
+                        Line::from(Span::styled(
+                            format!("{time:>11}"),
+                            Style::default().fg(Theme::LAVENDER),
+                        )),
+                        Line::from(""),
+                    ]),
                 ])
                 .style(selected_style)
                 .height(2),
@@ -982,7 +1067,7 @@ fn draw_ui(frame: &mut Frame<'_>, state: UiRender<'_>) -> (usize, usize) {
         .header(
             Row::new(["Session", "Preview", "Path", "Updated"]).style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Theme::BLUE)
                     .add_modifier(Modifier::BOLD),
             ),
         ),
@@ -1001,7 +1086,7 @@ fn draw_ui(frame: &mut Frame<'_>, state: UiRender<'_>) -> (usize, usize) {
         .header(
             Row::new(["Session", "Path", "Updated"]).style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Theme::BLUE)
                     .add_modifier(Modifier::BOLD),
             ),
         ),
@@ -1012,7 +1097,7 @@ fn draw_ui(frame: &mut Frame<'_>, state: UiRender<'_>) -> (usize, usize) {
         .header(
             Row::new(["Session", "Updated"]).style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Theme::BLUE)
                     .add_modifier(Modifier::BOLD),
             ),
         ),
@@ -1020,7 +1105,7 @@ fn draw_ui(frame: &mut Frame<'_>, state: UiRender<'_>) -> (usize, usize) {
             .header(
                 Row::new(["Session"]).style(
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(Theme::BLUE)
                         .add_modifier(Modifier::BOLD),
                 ),
             ),
@@ -1030,21 +1115,21 @@ fn draw_ui(frame: &mut Frame<'_>, state: UiRender<'_>) -> (usize, usize) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(Style::default().fg(Theme::SURFACE2))
+                .title_style(
+                    Style::default()
+                        .fg(Theme::BLUE)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .style(Style::default().bg(Theme::BASE))
                 .title(if filtered.is_empty() {
                     "No matching sessions"
                 } else {
                     "Sessions"
                 }),
         )
-        .row_highlight_style(Style::default().bg(Color::DarkGray));
+        .row_highlight_style(Style::default().bg(Theme::SURFACE1));
     frame.render_widget(table, areas[1]);
-    let footer = if mode == UiMode::Searching {
-        "Type to search  Enter confirm  Esc cancel  Ctrl-C quit"
-    } else if filtered.is_empty() {
-        "No matching sessions  / search  Esc quit"
-    } else {
-        "↑↓/jk move  Enter resume  PgUp/PgDn scroll  Tab view  / search  Esc back/quit"
-    };
     let position = if filtered.is_empty() {
         "0/0".to_string()
     } else {
@@ -1055,9 +1140,51 @@ fn draw_ui(frame: &mut Frame<'_>, state: UiRender<'_>) -> (usize, usize) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(1), Constraint::Length(page_width)])
         .split(areas[2]);
-    frame.render_widget(Paragraph::new(footer), footer_areas[0]);
+    let footer_line = if mode == UiMode::Searching {
+        Line::from(vec![
+            Span::styled("Type to search  ", Style::default().fg(Theme::SUBTEXT0)),
+            Span::styled("Enter", Style::default().fg(Theme::PINK)),
+            Span::styled(" confirm  ", Style::default().fg(Theme::SUBTEXT0)),
+            Span::styled("Esc", Style::default().fg(Theme::YELLOW)),
+            Span::styled(" cancel  ", Style::default().fg(Theme::SUBTEXT0)),
+            Span::styled("Ctrl-C", Style::default().fg(Theme::YELLOW)),
+            Span::styled(" quit", Style::default().fg(Theme::SUBTEXT0)),
+        ])
+    } else if filtered.is_empty() {
+        Line::from(vec![
+            Span::styled(
+                "No matching sessions  ",
+                Style::default().fg(Theme::SUBTEXT0),
+            ),
+            Span::styled("/", Style::default().fg(Theme::PINK)),
+            Span::styled(" search  ", Style::default().fg(Theme::SUBTEXT0)),
+            Span::styled("Esc", Style::default().fg(Theme::YELLOW)),
+            Span::styled(" quit", Style::default().fg(Theme::SUBTEXT0)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("↑↓/jk", Style::default().fg(Theme::YELLOW)),
+            Span::styled(" move  ", Style::default().fg(Theme::SUBTEXT0)),
+            Span::styled("Enter", Style::default().fg(Theme::PINK)),
+            Span::styled(" resume  ", Style::default().fg(Theme::SUBTEXT0)),
+            Span::styled("PgUp/PgDn", Style::default().fg(Theme::YELLOW)),
+            Span::styled(" scroll  ", Style::default().fg(Theme::SUBTEXT0)),
+            Span::styled("Tab", Style::default().fg(Theme::YELLOW)),
+            Span::styled(" view  ", Style::default().fg(Theme::SUBTEXT0)),
+            Span::styled("/", Style::default().fg(Theme::PINK)),
+            Span::styled(" search  ", Style::default().fg(Theme::SUBTEXT0)),
+            Span::styled("Esc", Style::default().fg(Theme::YELLOW)),
+            Span::styled(" back/quit", Style::default().fg(Theme::SUBTEXT0)),
+        ])
+    };
     frame.render_widget(
-        Paragraph::new(position).alignment(ratatui::layout::Alignment::Right),
+        Paragraph::new(footer_line).style(Style::default().bg(Theme::BASE)),
+        footer_areas[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(position, Style::default().fg(Theme::LAVENDER)))
+            .alignment(ratatui::layout::Alignment::Right)
+            .style(Style::default().bg(Theme::BASE)),
         footer_areas[1],
     );
     (capacity, start)
@@ -2722,7 +2849,7 @@ mod tests {
             let marker_is_red = (0..height).any(|y| {
                 (0..width).any(|x| {
                     let cell = &buffer[(x, y)];
-                    cell.symbol() == ">" && cell.fg == Color::Red
+                    cell.symbol() == ">" && cell.fg == Theme::PINK
                 })
             });
             assert!(
@@ -2854,7 +2981,7 @@ mod tests {
         assert!(row_text(&terminal, selected_row).contains("Session 11"));
         assert!((0..120).any(|x| {
             let cell = &after_down[(x, selected_row)];
-            cell.symbol() == ">" && cell.fg == Color::Red
+            cell.symbol() == ">" && cell.fg == Theme::PINK
         }));
         let (selected, offset) = move_selection(selected, offset, 1, capacity, sessions.len());
         assert_eq!((selected, offset), (11, 2));
@@ -2916,7 +3043,7 @@ mod tests {
                     let row: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
                     row.contains(&label)
                         && (0..width).any(|x| {
-                            buffer[(x, y)].symbol() == ">" && buffer[(x, y)].fg == Color::Red
+                            buffer[(x, y)].symbol() == ">" && buffer[(x, y)].fg == Theme::PINK
                         })
                 });
                 assert!(
